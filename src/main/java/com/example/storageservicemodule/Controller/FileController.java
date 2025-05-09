@@ -1,6 +1,8 @@
 package com.example.storageservicemodule.Controller;
 
 import com.example.storageservicemodule.Bean.*;
+import com.example.storageservicemodule.Exception.ResourceNotFoundException;
+import com.example.storageservicemodule.Exception.StorageException;
 import com.example.storageservicemodule.Interfaces.StorageService;
 import com.example.storageservicemodule.Repository.PhysicalServerRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,7 +14,18 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.MvcUriComponentsBuilder;
+import com.jcraft.jsch.Channel;
+import com.jcraft.jsch.ChannelSftp;
+import com.jcraft.jsch.JSch;
+import com.jcraft.jsch.JSchException;
+import com.jcraft.jsch.Session;
+import com.jcraft.jsch.SftpException;
+import com.jcraft.jsch.SftpATTRS;
+import org.apache.commons.io.FileUtils;
+import org.springframework.core.io.Resource;
 
+import java.io.File;
+import java.io.IOException;
 import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -125,293 +138,201 @@ public class FileController {
         return ResponseEntity.ok().body(response);
     }
 
+    @PostMapping("/deploy")
+    public ResponseEntity<FileDeployResponse> deployImageToServer(
+            @RequestParam("idServer") Integer  idServer,
+            @RequestParam("idImage") String idImage) {
 
-    @PostMapping("/transfer")
-    public ResponseEntity<String> transferFile(
-            @RequestParam(value = "sourceServerId") Integer sourceServerId,
-            @RequestParam(value = "destinationServerId") Integer destinationServerId,
-            @RequestParam(value = "sourceFilePath") String sourceFilePath,
-            @RequestParam(value = "destinationFilePath") String destinationFilePath) {
+        // Obtener servidor físico
+        PhysicalServer server = physicalServerRepository.findById(idServer)
+                .orElseThrow(() -> new ResourceNotFoundException("Servidor físico no encontrado con ID: " + idServer));
+
+        String serverIp = server.getGatewayAccessIp();
+        String username = server.getSshUsername();
+        String password = server.getSshPassword();
+        Integer port  =  server.getGatewayAccessPort();
+        String remoteTempPath ="/tmp";
 
         try {
-            // Get source server details
-            Optional<PhysicalServer> optionalSourceServer = physicalServerRepository.findById(sourceServerId);
-            if (!optionalSourceServer.isPresent()) {
-                return new ResponseEntity<>("Servidor de origen no encontrado", HttpStatus.NOT_FOUND);
-            }
-            PhysicalServer sourceServer = optionalSourceServer.get();
+            // Cargar el recurso de imagen
+            Resource imageResource = storageService.loadAsResource(idImage);
+            String remoteFilePath = remoteTempPath + "/" + imageResource.getFilename();
 
-            // Get destination server details
-            Optional<PhysicalServer> optionalDestinationServer = physicalServerRepository.findById(destinationServerId);
-            if (!optionalDestinationServer.isPresent()) {
-                return new ResponseEntity<>("Servidor de destino no encontrado", HttpStatus.NOT_FOUND);
-            }
-            PhysicalServer destinationServer = optionalDestinationServer.get();
+            // Transferir el archivo al servidor remoto
+            boolean success = transferResourceToRemoteServer(
+                    imageResource,
+                    serverIp,
+                    username,
+                    port ,
+                    password,
+                    remoteFilePath
+            );
 
-            // First, download file from source server to a temporary location
-            Path tempDir = Files.createTempDirectory("file_transfer");
-            String tempFileName = UUID.randomUUID().toString();
-            Path tempFilePath = tempDir.resolve(tempFileName);
-
-            // Download from source server
-            boolean downloadSuccess = downloadFromServer(sourceServer, sourceFilePath, tempFilePath);
-            if (!downloadSuccess) {
-                Files.deleteIfExists(tempFilePath);
-                Files.deleteIfExists(tempDir);
-                return new ResponseEntity<>("Error al descargar el archivo del servidor origen",
-                        HttpStatus.INTERNAL_SERVER_ERROR);
+            if (!success) {
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .body(new FileDeployResponse(
+                                idImage,
+                                server.getName(),
+                                null,
+                                "Falló la transferencia del archivo al servidor",
+                                new Date()
+                        ));
             }
 
-            // Upload to destination server
-            boolean uploadSuccess = uploadToServer(destinationServer, tempFilePath, destinationFilePath);
+            // Crear respuesta
+            FileDeployResponse response = new FileDeployResponse(
+                    idImage,
+                    server.getName(),
+                    remoteFilePath,
+                    "Imagen desplegada exitosamente en el servidor " + serverIp,
+                    new Date()
+            );
 
-            // Clean up temporary files
-            Files.deleteIfExists(tempFilePath);
-            Files.deleteIfExists(tempDir);
+            return ResponseEntity.ok().body(response);
 
-            if (!uploadSuccess) {
-                return new ResponseEntity<>("Error al subir el archivo al servidor destino",
-                        HttpStatus.INTERNAL_SERVER_ERROR);
-            }
-
-            return new ResponseEntity<>("Archivo transferido exitosamente entre servidores", HttpStatus.OK);
-
-        } catch (Exception e) {
-            return new ResponseEntity<>("Error durante la transferencia: " + e.getMessage(),
-                    HttpStatus.INTERNAL_SERVER_ERROR);
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(new FileDeployResponse(
+                            idImage,
+                            server.getName(),
+                            null,
+                            "Error al procesar el archivo: " + e.getMessage(),
+                            new Date()
+                    ));
         }
     }
 
-    private boolean downloadFromServer(PhysicalServer server, String remotePath, Path localPath) throws Exception {
-        // Determine transfer method based on server configuration
-        String transferType = determineTransferType(server);
+    /**
+     * Transfiere un recurso a un servidor remoto usando SSH/SFTP
+     *
+     * @param resource       El recurso a transferir
+     * @param serverIp       La dirección IP del servidor destino
+     * @param username       El nombre de usuario para la conexión SSH
+     * @param password       La contraseña para la conexión SSH
+     * @param remoteFilePath La ruta completa donde se guardará el archivo en el servidor remoto
+     * @return true si la transferencia fue exitosa, false en caso contrario
+     * @throws IOException si hay un problema al acceder al recurso
+     */
+    public boolean transferResourceToRemoteServer(
+            Resource resource,
+            String serverIp,
+            String username,Integer port ,
+            String password,
+            String remoteFilePath) throws IOException {
 
-        switch (transferType.toLowerCase()) {
-            case "local":
-                return downloadLocal(remotePath, localPath);
-            case "sftp":
-                return downloadSftp(server, remotePath, localPath);
-            case "ftp":
-                return downloadFtp(server, remotePath, localPath);
-            default:
-                throw new IllegalArgumentException("Tipo de transferencia no soportado para el servidor: " + transferType);
-        }
-    }
-
-    private boolean uploadToServer(PhysicalServer server, Path localPath, String remotePath) throws Exception {
-        // Determine transfer method based on server configuration
-        String transferType = determineTransferType(server);
-
-        switch (transferType.toLowerCase()) {
-            case "local":
-                return uploadLocal(localPath, remotePath);
-            case "sftp":
-                return uploadSftp(server, localPath, remotePath);
-            case "ftp":
-                return uploadFtp(server, localPath, remotePath);
-            default:
-                throw new IllegalArgumentException("Tipo de transferencia no soportado para el servidor: " + transferType);
-        }
-    }
-
-    private String determineTransferType(PhysicalServer server) {
-        // Determine the transfer type based on the server configuration
-        // This could be a property of the server or inferred from available connection details
-        if (server.getInfrastructureType().equalsIgnoreCase("local")) {
-            return "local";
-        } else if (server.getAuthMethod().equalsIgnoreCase("ssh") ||
-                server.getAuthMethod().equalsIgnoreCase("password")) {
-            return "sftp";
-        } else {
-            return "ftp";
-        }
-    }
-
-    // Local file transfer methods
-    private boolean downloadLocal(String sourcePath, Path destPath) throws IOException {
-        Path source = Paths.get(sourcePath);
-
-        // Check if source file exists
-        if (!Files.exists(source)) {
-            throw new FileNotFoundException("El archivo de origen no existe: " + sourcePath);
-        }
-
-        // Copy the file
-        Files.copy(source, destPath, StandardCopyOption.REPLACE_EXISTING);
-        return true;
-    }
-
-    private boolean uploadLocal(Path sourcePath, String destPath) throws IOException {
-        Path destination = Paths.get(destPath);
-
-        // Create destination directory if it doesn't exist
-        Files.createDirectories(destination.getParent());
-
-        // Copy the file
-        Files.copy(sourcePath, destination, StandardCopyOption.REPLACE_EXISTING);
-        return true;
-    }
-
-    // SFTP transfer methods
-    private boolean downloadSftp(PhysicalServer server, String remotePath, Path localPath) {
+        JSch jsch = new JSch();
         Session session = null;
-        Channel channel = null;
         ChannelSftp channelSftp = null;
 
         try {
-            JSch jsch = new JSch();
-            session = jsch.getSession(server.getSshUsername(), server.getIp(), server.getSshPort());
-
-            // Handle different authentication methods
-            if (server.getAuthMethod().equalsIgnoreCase("password")) {
-                session.setPassword(server.getSshPassword());
-            } else if (server.getAuthMethod().equalsIgnoreCase("key")) {
-                jsch.addIdentity(server.getSshKeyPath());
+            // Convertir el recurso a un archivo temporal si no es un archivo
+            File fileToTransfer;
+            if (resource.isFile()) {
+                fileToTransfer = resource.getFile();
+            } else {
+                // Crear un archivo temporal para transferir recursos que no son archivos
+                fileToTransfer = File.createTempFile("temp_transfer_", "_" + resource.getFilename());
+                FileUtils.copyInputStreamToFile(resource.getInputStream(), fileToTransfer);
+                fileToTransfer.deleteOnExit(); // Eliminar el archivo al salir
             }
 
-            // Configure session
+            // Configurar la sesión SSH
+            session = jsch.getSession(username, serverIp, port); // Puerto SSH por defecto
+            session.setPassword(password);
+
+            // Configuración para evitar verificación de host conocido (ajustar para producción)
             java.util.Properties config = new java.util.Properties();
             config.put("StrictHostKeyChecking", "no");
             session.setConfig(config);
 
-            session.connect();
+            // Conectar al servidor
+            session.connect(30000); // Timeout de 30 segundos
 
-            channel = session.openChannel("sftp");
-            channel.connect();
+            // Abrir canal SFTP
+            Channel channel = session.openChannel("sftp");
+            channel.connect(30000);
             channelSftp = (ChannelSftp) channel;
 
-            // Create parent directories for local path
-            Files.createDirectories(localPath.getParent());
-
-            // Download the file
-            try (OutputStream os = Files.newOutputStream(localPath)) {
-                channelSftp.get(remotePath, os);
-            }
-
-            return true;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        } finally {
-            if (channelSftp != null) channelSftp.exit();
-            if (channel != null) channel.disconnect();
-            if (session != null) session.disconnect();
-        }
-    }
-
-    private boolean uploadSftp(PhysicalServer server, Path localPath, String remotePath) {
-        Session session = null;
-        Channel channel = null;
-        ChannelSftp channelSftp = null;
-
-        try {
-            JSch jsch = new JSch();
-            session = jsch.getSession(server.getSshUsername(), server.getIp(), server.getSshPort());
-
-            // Handle different authentication methods
-            if (server.getAuthMethod().equalsIgnoreCase("password")) {
-                session.setPassword(server.getSshPassword());
-            } else if (server.getAuthMethod().equalsIgnoreCase("key")) {
-                jsch.addIdentity(server.getSshKeyPath());
-            }
-
-            // Configure session
-            java.util.Properties config = new java.util.Properties();
-            config.put("StrictHostKeyChecking", "no");
-            session.setConfig(config);
-
-            session.connect();
-
-            channel = session.openChannel("sftp");
-            channel.connect();
-            channelSftp = (ChannelSftp) channel;
-
-            // Create remote directory if it doesn't exist
+            // Asegurar que el directorio de destino existe
+            String remoteDir = remoteFilePath.substring(0, remoteFilePath.lastIndexOf('/'));
             try {
-                String destDir = remotePath.substring(0, remotePath.lastIndexOf('/'));
-                channelSftp.mkdir(destDir);
+                // Intentar crear estructura de directorios recursivamente
+                createRemoteDirectoryStructure(channelSftp, remoteDir);
             } catch (SftpException e) {
-                // Ignore if directory already exists
+                // Ignorar error si el directorio ya existe
+                if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                    throw e;
+                }
             }
 
-            // Upload the file
-            try (InputStream is = Files.newInputStream(localPath)) {
-                channelSftp.put(is, remotePath);
+            // Transferir el archivo
+            channelSftp.put(fileToTransfer.getAbsolutePath(), remoteFilePath, ChannelSftp.OVERWRITE);
+
+            // Verificar que el archivo existe en el destino después de la transferencia
+            try {
+                SftpATTRS attrs = channelSftp.stat(remoteFilePath);
+                // Verificar tamaño para asegurar que la transferencia fue completa
+                if (attrs.getSize() != fileToTransfer.length()) {
+                    System.err.println("¡Advertencia! El tamaño del archivo transferido no coincide.");
+                    return false;
+                }
+            } catch (SftpException e) {
+                System.err.println("Error al verificar el archivo transferido: " + e.getMessage());
+                return false;
             }
 
             return true;
-        } catch (Exception e) {
+        } catch (JSchException | SftpException e) {
+            System.err.println("Error durante la transferencia SFTP: " + e.getMessage());
             e.printStackTrace();
             return false;
         } finally {
-            if (channelSftp != null) channelSftp.exit();
-            if (channel != null) channel.disconnect();
-            if (session != null) session.disconnect();
-        }
-    }
-
-    // FTP transfer methods
-    private boolean downloadFtp(PhysicalServer server, String remotePath, Path localPath) {
-        org.apache.commons.net.ftp.FTPClient ftpClient = new org.apache.commons.net.ftp.FTPClient();
-
-        try {
-            ftpClient.connect(server.getIp(), server.getSshPort()); // Using SSH port for FTP as well
-            ftpClient.login(server.getSshUsername(), server.getSshPassword());
-            ftpClient.enterLocalPassiveMode();
-            ftpClient.setFileType(org.apache.commons.net.ftp.FTP.BINARY_FILE_TYPE);
-
-            // Create parent directories for local path
-            Files.createDirectories(localPath.getParent());
-
-            // Download the file
-            try (OutputStream outputStream = Files.newOutputStream(localPath)) {
-                boolean success = ftpClient.retrieveFile(remotePath, outputStream);
-                return success;
+            // Cerrar conexiones
+            if (channelSftp != null && channelSftp.isConnected()) {
+                channelSftp.disconnect();
             }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        } finally {
-            try {
-                if (ftpClient.isConnected()) {
-                    ftpClient.logout();
-                    ftpClient.disconnect();
-                }
-            } catch (IOException e) {
-                // Ignore exceptions on close
+            if (session != null && session.isConnected()) {
+                session.disconnect();
             }
         }
     }
 
-    private boolean uploadFtp(PhysicalServer server, Path localPath, String remotePath) {
-        org.apache.commons.net.ftp.FTPClient ftpClient = new org.apache.commons.net.ftp.FTPClient();
+    /**
+     * Crea una estructura de directorios en el servidor remoto de forma recursiva
+     *
+     * @param channelSftp Canal SFTP ya conectado
+     * @param remotePath Ruta a crear
+     * @throws SftpException Si ocurre un error durante la operación
+     */
+    private void createRemoteDirectoryStructure(ChannelSftp channelSftp, String remotePath) throws SftpException {
+        // Si estamos en la raíz, no hay nada que crear
+        if (remotePath.equals("") || remotePath.equals("/")) {
+            return;
+        }
 
-        try {
-            ftpClient.connect(server.getIp(), server.getSshPort()); // Using SSH port for FTP as well
-            ftpClient.login(server.getSshUsername(), server.getSshPassword());
-            ftpClient.enterLocalPassiveMode();
-            ftpClient.setFileType(org.apache.commons.net.ftp.FTP.BINARY_FILE_TYPE);
+        String[] folders = remotePath.split("/");
+        String currentPath = "";
 
-            // Create directory if it doesn't exist
-            String destDir = remotePath.substring(0, remotePath.lastIndexOf('/'));
-            ftpClient.makeDirectory(destDir);
+        // Para servidores Unix/Linux que comienzan con /
+        if (remotePath.startsWith("/")) {
+            currentPath = "/";
+        }
 
-            // Upload the file
-            try (InputStream inputStream = Files.newInputStream(localPath)) {
-                boolean success = ftpClient.storeFile(remotePath, inputStream);
-                return success;
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        } finally {
+        // Crear cada nivel de directorio
+        for (String folder : folders) {
+            if (folder.isEmpty()) continue;
+
+            currentPath += folder + "/";
             try {
-                if (ftpClient.isConnected()) {
-                    ftpClient.logout();
-                    ftpClient.disconnect();
+                channelSftp.cd(currentPath);
+            } catch (SftpException e) {
+                // Si el directorio no existe, crearlo
+                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                    channelSftp.mkdir(currentPath);
+                    channelSftp.cd(currentPath);
+                } else {
+                    throw e;
                 }
-            } catch (IOException e) {
-                // Ignore exceptions on close
             }
         }
     }
