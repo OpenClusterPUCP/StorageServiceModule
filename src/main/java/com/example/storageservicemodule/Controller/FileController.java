@@ -151,7 +151,13 @@ public class FileController {
         String username = server.getSshUsername();
         String password = server.getSshPassword();
         Integer port  =  server.getGatewayAccessPort();
-        String remoteTempPath ="/tmp";
+        String remoteTempPath = "";
+        if(server.getServerType().equals("headnode")){
+            remoteTempPath ="/home/ubuntu/SliceManager/images";
+
+        }else if(server.getServerType().equals("worker")){
+             remoteTempPath ="/home/ubuntu/SliceManager/base";
+        }
 
         try {
             // Cargar el recurso de imagen
